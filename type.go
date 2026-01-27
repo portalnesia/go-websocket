@@ -12,6 +12,8 @@ type MessageMultiNodes struct {
 }
 
 type BroadcastData struct {
+	FromServerID string `json:"from_id"`
+
 	Room string `json:"room,omitempty"`
 
 	Key   string `json:"key,omitempty"`

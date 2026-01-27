@@ -1,18 +1,14 @@
 package websocket
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"sync"
-
-	"github.com/coder/websocket"
-	"github.com/coder/websocket/wsjson"
 )
 
 // Namespace represents a logical boundary for connections and events
 type connWrapper struct {
-	ws   *websocket.Conn
+	ws   WSConn
 	send chan Message
 	ctx  *ConnContext
 	once sync.Once
@@ -62,6 +58,11 @@ func (n *Namespace) init() {
 	if n.server.adapter != nil {
 		n.server.GetLogger().Debug("Subscribing to adapter", "namespace", n.name)
 		n.server.adapter.Subscribe(n.name, func(data BroadcastData) {
+			if data.FromServerID == n.server.id {
+				// Ignore messages from self
+				return
+			}
+
 			if data.Room != "" {
 				n.broadcastToRoomLocal(data.Room, data.Message)
 			} else if data.Key != "" && data.Value != nil {
@@ -138,18 +139,19 @@ func (n *Namespace) broadcastToConnectionsIf(msg Message, predicate func(connID 
 	}()
 }
 
-func (n *Namespace) addConn(connID string, ws *websocket.Conn, r *http.Request) *ConnContext {
+func (n *Namespace) addConn(connID string, ws WSConn, r *http.Request) *ConnContext {
 	ctx := &ConnContext{
 		id:        connID,
 		namespace: n,
 		request:   r,
+		done:      make(chan struct{}),
 	}
 
 	// Call onConnect handler
 	if n.onConnect != nil {
 		if err := n.onConnect(ctx); err != nil {
 			// Reject connection
-			_ = ws.Close(websocket.StatusPolicyViolation, "connection rejected")
+			_ = ws.Close(1008, "connection rejected")
 			n.server.GetLogger().Debug("Connection rejected", "namespace", n.name, "connID", connID, "error", err.Error())
 			return nil
 		}
@@ -178,7 +180,7 @@ func (n *Namespace) addConn(connID string, ws *websocket.Conn, r *http.Request) 
 
 func (n *Namespace) startWriteLoop(cw *connWrapper) {
 	for msg := range cw.send {
-		if err := wsjson.Write(context.Background(), cw.ws, msg); err != nil {
+		if err := cw.ws.WriteJSON(msg); err != nil {
 			n.server.GetLogger().Error("Write error", "namespace", n.name, "connID", cw.ctx.id, "error", err.Error())
 			return
 		}
@@ -193,7 +195,7 @@ func (n *Namespace) startReadLoop(ctx *ConnContext, cw *connWrapper) {
 
 	for {
 		var msg Message
-		if err := wsjson.Read(context.Background(), cw.ws, &msg); err != nil {
+		if err := cw.ws.ReadJSON(&msg); err != nil {
 			n.server.GetLogger().Debug("Read error", "namespace", n.name, "connID", ctx.id, "error", err.Error())
 			return
 		}
@@ -240,7 +242,8 @@ func (n *Namespace) Emit(message Message) {
 	// If adapter is set, publish to Redis for multi-node (already async)
 	if n.server.adapter != nil {
 		n.server.adapter.Broadcast(n.name, BroadcastData{
-			Message: nodeMsg,
+			FromServerID: n.server.id,
+			Message:      nodeMsg,
 		})
 	}
 
@@ -266,7 +269,8 @@ func (n *Namespace) EmitExcept(excludeConnIds []string, message Message) {
 	// If adapter is set, publish to Redis for multi-node (already async)
 	if n.server.adapter != nil {
 		n.server.adapter.Broadcast(n.name, BroadcastData{
-			Message: nodeMsg,
+			FromServerID: n.server.id,
+			Message:      nodeMsg,
 		})
 	}
 
@@ -308,8 +312,9 @@ func (n *Namespace) EmitToRoom(roomName string, message Message) {
 	// If adapter is set, publish to Redis for multi-node (already async)
 	if n.server.adapter != nil {
 		n.server.adapter.Broadcast(n.name, BroadcastData{
-			Room:    roomName,
-			Message: nodeMsg,
+			FromServerID: n.server.id,
+			Room:         roomName,
+			Message:      nodeMsg,
 		})
 	}
 
@@ -367,8 +372,9 @@ func (n *Namespace) EmitToRoomExcept(roomName string, excludeConnIds []string, m
 	// If adapter is set, publish to Redis for multi-node (already async)
 	if n.server.adapter != nil {
 		n.server.adapter.Broadcast(n.name, BroadcastData{
-			Room:    roomName,
-			Message: nodeMsg,
+			FromServerID: n.server.id,
+			Room:         roomName,
+			Message:      nodeMsg,
 		})
 	}
 
@@ -479,7 +485,8 @@ func (n *Namespace) closeConn(ctx *ConnContext) {
 	// Close connection and cleanup
 	cw.once.Do(func() {
 		close(cw.send)
-		_ = cw.ws.Close(websocket.StatusNormalClosure, "connection closed")
+		_ = cw.ws.Close(1000, "connection closed")
+		close(ctx.done)
 	})
 
 	if n.onDisconnect != nil {
@@ -548,9 +555,10 @@ func (n *Namespace) EmitToLocalKeyValue(key string, value any, message Message) 
 	// If adapter is set, publish to Redis for multi-node (already async)
 	if n.server.adapter != nil {
 		n.server.adapter.Broadcast(n.name, BroadcastData{
-			Message: msg,
-			Key:     key,
-			Value:   value,
+			FromServerID: n.server.id,
+			Message:      msg,
+			Key:          key,
+			Value:        value,
 		})
 	}
 

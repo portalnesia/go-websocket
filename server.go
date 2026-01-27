@@ -15,6 +15,7 @@ const (
 )
 
 type Server struct {
+	id              string
 	mu              sync.RWMutex
 	namespaces      map[string]*Namespace
 	wsPath          string
@@ -31,6 +32,7 @@ type Server struct {
 
 func NewServer() *Server {
 	return &Server{
+		id:              generateId(),
 		namespaces:      make(map[string]*Namespace),
 		wsPath:          DefaultWSPath,
 		originPatterns:  []string{},
@@ -124,6 +126,10 @@ func (s *Server) Of(name string) *Namespace {
 
 // SetWSPath sets custom WebSocket path
 func (s *Server) SetWSPath(path string) {
+	// always start with /
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
 	s.wsPath = path
 }
 
@@ -267,7 +273,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	connID := generateId()
-	ns.addConn(connID, ws, r)
+	ns.addConn(connID, newCoderWSConn(ws), r)
 }
 
 // Listen starts the WebSocket server on the specified address

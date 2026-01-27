@@ -13,6 +13,7 @@ type ConnContext struct {
 	request   *http.Request
 	local     map[string]any
 	localMu   sync.RWMutex
+	done      chan struct{}
 }
 
 // ID returns the connection ID
@@ -124,4 +125,9 @@ func (c *ConnContext) Rooms() []string {
 
 func (c *ConnContext) Close() {
 	c.namespace.closeConn(c)
+}
+
+// Done returns a channel that's closed when the connection is closed
+func (c *ConnContext) Done() <-chan struct{} {
+	return c.done
 }
