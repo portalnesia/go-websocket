@@ -1,12 +1,18 @@
 package redis
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	coderws "github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	"github.com/redis/go-redis/v9"
 	websocket "go.portalnesia.com/websocket"
 )
@@ -441,13 +447,14 @@ func TestAdapterErrorCallback(t *testing.T) {
 	defer mr.Close()
 	defer client.Close()
 
-	errorCalled := false
-	var errorMsg string
+	errs := make(chan error, 1)
 
 	cfg := &Config{
 		ErrorCallback: func(err error) {
-			errorCalled = true
-			errorMsg = err.Error()
+			select {
+			case errs <- err:
+			default:
+			}
 		},
 	}
 
@@ -465,14 +472,180 @@ func TestAdapterErrorCallback(t *testing.T) {
 	mr.Publish(channel, "invalid json{{{")
 
 	// Wait for error callback
-	time.Sleep(200 * time.Millisecond)
-
-	if !errorCalled {
+	select {
+	case err := <-errs:
+		if err.Error() == "" {
+			t.Error("Error message should not be empty")
+		}
+	case <-time.After(2 * time.Second):
 		t.Error("Error callback should be called for invalid JSON")
 	}
+}
 
-	if errorMsg == "" {
-		t.Error("Error message should not be empty")
+func TestNewUniversalClient(t *testing.T) {
+	mr, _ := setupTestRedis(t)
+	defer mr.Close()
+
+	uc := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{mr.Addr()}})
+	defer uc.Close()
+
+	adapter, err := New(uc)
+	if err != nil {
+		t.Fatalf("New(UniversalClient) error = %v", err)
+	}
+	adapter.Close()
+}
+
+// node is one websocket.Server with its own Redis adapter, served over httptest
+type node struct {
+	server *websocket.Server
+	ns     *websocket.Namespace
+	url    string
+}
+
+func newNode(t *testing.T, mr *miniredis.Miniredis, client redis.UniversalClient) *node {
+	t.Helper()
+	adapter, err := New(client)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	s := websocket.NewServer()
+	s.SetLogger(websocket.NewNoopLogger())
+	s.SetOriginPatterns([]string{"*"})
+	s.SetPingInterval(0)
+	s.SetAdapter(adapter)
+	ns := s.Of("/")
+	ns.OnConnect(func(ctx *websocket.ConnContext) error {
+		if room := ctx.Query("room"); room != "" {
+			ctx.JoinRoom(room)
+		}
+		return nil
+	})
+
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(func() {
+		srv.Close()
+		s.Close()
+	})
+
+	channel := adapter.makeNamespaceChannel("/")
+	deadline := time.Now().Add(2 * time.Second)
+	for mr.PubSubNumSub(channel)[channel] == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	return &node{server: s, ns: ns, url: "ws" + strings.TrimPrefix(srv.URL, "http") + websocket.DefaultWSPath}
+}
+
+// dial connects a client to the node and waits until the node registered it.
+// Query "room" makes the connection join that room (see newNode).
+func (n *node) dial(t *testing.T, query ...string) *coderws.Conn {
+	t.Helper()
+	before := n.ns.ConnectionCount()
+	url := n.url
+	if len(query) > 0 {
+		url += "?" + query[0]
+	}
+	c, _, err := coderws.Dial(context.Background(), url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.CloseNow() })
+	deadline := time.Now().Add(2 * time.Second)
+	for n.ns.ConnectionCount() == before && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	return c
+}
+
+// readEvent reads the next message within timeout; ok=false when nothing arrives
+func readEvent(c *coderws.Conn, timeout time.Duration) (websocket.Message, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var msg websocket.Message
+	if err := wsjson.Read(ctx, c, &msg); err != nil {
+		return msg, false
+	}
+	return msg, true
+}
+
+func TestTwoServersForwardBroadcast(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+	uc := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{mr.Addr()}})
+	defer uc.Close()
+
+	a := newNode(t, mr, client)
+	b := newNode(t, mr, uc)
+	ca := a.dial(t)
+	cb := b.dial(t)
+
+	a.ns.Emit(websocket.Message{Event: "from-a"})
+	if msg, ok := readEvent(cb, 2*time.Second); !ok || msg.Event != "from-a" {
+		t.Errorf("node B client got %+v ok=%v, want from-a", msg, ok)
+	}
+
+	b.ns.Emit(websocket.Message{Event: "from-b"})
+	// ca also received from-a locally first
+	for i := 0; i < 2; i++ {
+		msg, ok := readEvent(ca, 2*time.Second)
+		if !ok {
+			t.Fatal("node A client did not receive from-b")
+		}
+		if msg.Event == "from-b" {
+			return
+		}
+	}
+	t.Error("node A client did not receive from-b")
+}
+
+func TestEmitToRoomsAcrossNodes(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	a := newNode(t, mr, client)
+	b := newNode(t, mr, client)
+	inRoom := b.dial(t, "room=r2")
+	outside := b.dial(t, "room=r9")
+
+	a.ns.EmitToRooms([]string{"r1", "r2"}, websocket.Message{Event: "rooms"})
+	if msg, ok := readEvent(inRoom, 2*time.Second); !ok || msg.Event != "rooms" {
+		t.Errorf("client in r2 on node B got %+v ok=%v, want rooms", msg, ok)
+	}
+	if msg, ok := readEvent(outside, 200*time.Millisecond); ok {
+		t.Errorf("client outside target rooms received %+v", msg)
+	}
+
+	a.ns.EmitToRoom("r2", websocket.Message{Event: "room"})
+	if msg, ok := readEvent(inRoom, 2*time.Second); !ok || msg.Event != "room" {
+		t.Errorf("EmitToRoom: client in r2 got %+v ok=%v, want room", msg, ok)
+	}
+}
+
+func TestCloseRoomsAcrossNodes(t *testing.T) {
+	mr, client := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	a := newNode(t, mr, client)
+	b := newNode(t, mr, client)
+	inRoom := b.dial(t, "room=r1")
+	outside := b.dial(t, "room=r9")
+
+	a.ns.CloseRooms([]string{"r1"}, 4401, "unauthorized")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _, err := inRoom.Read(ctx)
+	var ce coderws.CloseError
+	if !errors.As(err, &ce) || ce.Code != 4401 || ce.Reason != "unauthorized" {
+		t.Errorf("client in r1 on node B: close = %v, want 4401 unauthorized", err)
+	}
+
+	b.ns.Emit(websocket.Message{Event: "still-open"})
+	if msg, ok := readEvent(outside, 2*time.Second); !ok || msg.Event != "still-open" {
+		t.Errorf("client outside r1 should stay open, got %+v ok=%v", msg, ok)
 	}
 }
 

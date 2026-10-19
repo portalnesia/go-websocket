@@ -1,5 +1,7 @@
 # Go WebSocket Library
 
+[![Test](https://github.com/portalnesia/go-websocket/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/portalnesia/go-websocket/actions/workflows/test.yml)
+
 A Go WebSocket library inspired by socket.io, but more explicit, simpler, and doesn't hide the protocol. Clients can use native WebSocket without requiring a specialized SDK.
 
 ## Key Features
@@ -123,6 +125,12 @@ server.SetOriginPatterns([]string{"^https?://.*\\.myapp\\.com$"})
 // Set custom logger (optional)
 server.SetLogger(websocket.NewDefaultLogger()) // or NewNoopLogger()
 
+// Connection limits (call before serving; values below are the defaults)
+server.SetPingInterval(25 * time.Second) // heartbeat ping interval, 0 = heartbeat off
+server.SetPongTimeout(10 * time.Second)  // no pong within this time -> connection closed
+server.SetWriteTimeout(10 * time.Second) // slower write -> connection closed, 0 = no timeout
+server.SetReadLimit(64 << 10)            // larger incoming message -> closed with 1009, <= 0 = unlimited
+
 // Start server
 server.Listen(":8080")
 
@@ -241,7 +249,18 @@ ns.On("room:message", func(ctx *websocket.ConnContext, data any) {
 })
 ```
 
-### 6. Broadcast Methods
+### 6. Connection Limits
+
+| Setting | Default constant | Default | Effect |
+|---|---|---|---|
+| `SetPingInterval` | `DefaultPingInterval` | 25s | Server pings every connection at this interval. `0` disables heartbeat. |
+| `SetPongTimeout` | `DefaultPongTimeout` | 10s | No pong within this time closes the connection (`OnDisconnect` runs). |
+| `SetWriteTimeout` | `DefaultWriteTimeout` | 10s | A write slower than this (stalled client) closes the connection. `0` = no timeout. |
+| `SetReadLimit` | `DefaultReadLimit` | 64 KiB | An incoming message larger than this closes the connection with code `1009`. `<= 0` = unlimited. |
+
+Browsers answer pings automatically, so clients need no code for the heartbeat.
+
+### 7. Broadcast Methods
 
 ```go
 // 1. Send to single connection
@@ -258,6 +277,38 @@ ns.EmitToRoom("room_name", websocket.Message{Event: "event_name", Data: data})
 
 // 5. Broadcast to room except sender
 ctx.BroadcastToRoom("room_name", websocket.Message{Event: "event_name", Data: data})
+
+// 6. Broadcast to several rooms (one adapter publish; a connection in many of the rooms receives it once)
+ns.EmitToRooms([]string{"room_a", "room_b"}, websocket.Message{Event: "event_name", Data: data})
+```
+
+### 8. Closing Connections
+
+```go
+// Close one connection with an application close code and reason
+ctx.CloseWith(4401, "unauthorized")
+
+// Close() is CloseWith(1000, "connection closed")
+ctx.Close()
+
+// Close every connection in the rooms, on all nodes
+ns.CloseRooms([]string{"user:42"}, 4401, "session revoked")
+```
+
+- Valid codes: `1000` and `3000–4999`. **`3000–4999` are reserved for your application**; the library
+  never sends them itself (it uses `1000`, `1008` when `OnConnect` rejects, `1009` for a message too big,
+  and protocol codes from the WebSocket implementation).
+  Any other code is replaced by `1000` and a warning is logged.
+- Keep the reason under 123 bytes (WebSocket close frame limit).
+- Closing never waits for the network: the connection is removed at once, the close frame and
+  `OnDisconnect` run in background. `OnDisconnect` runs exactly once per connection.
+
+The client sees the code in `CloseEvent.code`:
+
+```javascript
+ws.onclose = (e) => {
+    if (e.code === 4401) redirectToLogin();
+};
 ```
 
 ## Authentication & Reconnection
@@ -332,8 +383,20 @@ function rejoinRooms() {
 ### Server
 
 ```go
+const (
+    DefaultPingInterval = 25 * time.Second
+    DefaultPongTimeout  = 10 * time.Second
+    DefaultWriteTimeout = 10 * time.Second
+    DefaultReadLimit    = 64 << 10 // bytes
+)
+
 func NewServer() *Server
+func NewFiberServer() *Server
 func (s *Server) SetWSPath(path string)
+func (s *Server) SetPingInterval(d time.Duration)
+func (s *Server) SetPongTimeout(d time.Duration)
+func (s *Server) SetWriteTimeout(d time.Duration)
+func (s *Server) SetReadLimit(n int64)
 func (s *Server) SetOriginPatterns(patterns []string)
 func (s *Server) SetAdapter(adapter Adapter)
 func (s *Server) SetLogger(logger Logger)
@@ -354,6 +417,8 @@ func (ns *Namespace) Emit(msg Message)
 func (ns *Namespace) EmitExcept(excludeConnIds []string, msg Message)
 func (ns *Namespace) EmitToRoom(roomName string, msg Message)
 func (ns *Namespace) EmitToRoomExcept(roomName string, excludeConnIds []string, msg Message)
+func (ns *Namespace) EmitToRooms(rooms []string, msg Message)
+func (ns *Namespace) CloseRooms(rooms []string, code int, reason string)
 func (ns *Namespace) ConnectionCount() int
 func (ns *Namespace) RoomSize(roomName string) int
 func (ns *Namespace) GetAllConnections() []*ConnContext
@@ -377,6 +442,7 @@ func (c *ConnContext) JoinRoom(roomName string)
 func (c *ConnContext) LeaveRoom(roomName string)
 func (c *ConnContext) Rooms() []string
 func (c *ConnContext) Close()
+func (c *ConnContext) CloseWith(code int, reason string)
 ```
 
 ## Examples
@@ -407,11 +473,9 @@ import (
 )
 
 func main() {
-    // Create Redis client
-    redisClient := redis.NewClient(&redis.Options{
-        Addr: "localhost:6379",
-        Password: "",
-        DB: 0,
+    // Any redis.UniversalClient works: *redis.Client, cluster, sentinel/failover
+    redisClient := redis.NewUniversalClient(&redis.UniversalOptions{
+        Addrs: []string{"localhost:6379"},
     })
 
     // Create Redis adapter with optional config
@@ -435,6 +499,8 @@ func main() {
     // Now broadcasts will work across all nodes
     ns.Emit(message) // Reaches all nodes via Redis pub/sub
     ns.EmitToRoom("room", message) // Reaches all nodes
+    ns.EmitToRooms([]string{"a", "b"}, message) // One publish for all rooms
+    ns.CloseRooms([]string{"a"}, 4000, "closed") // Closes connections in room "a" on all nodes
 }
 ```
 
@@ -445,6 +511,11 @@ func main() {
 3. **Automatic Subscription**: Adapter automatically subscribes to namespace channels
 4. **Bounded Concurrency**: Publish operations are limited to prevent resource exhaustion
 5. **Graceful Shutdown**: Waits for pending operations during close
+6. **At-most-once**: Messages published while a node or Redis is disconnected are lost; nothing is stored or resent
+7. **Rooms are per node**: Membership is not synced; room emits and closes are published and each node applies them locally
+8. **Mixed versions**: Payloads from `EmitToRooms`/`CloseRooms` carry a guard so nodes running an older version
+   ignore them instead of broadcasting to everyone. Those older nodes do not deliver them, so upgrade every node
+   before relying on these methods.
 
 ### Logger Support
 

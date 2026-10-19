@@ -123,8 +123,16 @@ func (c *ConnContext) Rooms() []string {
 	return result
 }
 
+// Close closes the connection with code 1000; same as CloseWith(1000, "connection closed")
 func (c *ConnContext) Close() {
-	c.namespace.closeConn(c)
+	c.CloseWith(1000, "connection closed")
+}
+
+// CloseWith closes the connection with code and reason sent in the close frame.
+// Valid codes are 1000 and 3000-4999; others are replaced by 1000.
+// The connection is removed immediately; the close frame and OnDisconnect run in background.
+func (c *ConnContext) CloseWith(code int, reason string) {
+	c.namespace.closeConnAsync(c, c.namespace.closeCode(code), reason)
 }
 
 // Done returns a channel that's closed when the connection is closed

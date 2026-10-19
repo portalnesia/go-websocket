@@ -1,9 +1,17 @@
 package websocket
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 func TestNewServer(t *testing.T) {
@@ -353,15 +361,109 @@ func TestServerCloseWithAdapter(t *testing.T) {
 	}
 }
 
+// newLimitServer returns a server with a 1KB read limit whose "msg" events are sent to got
+func newLimitServer() (*Server, chan string) {
+	s := newTestServer()
+	s.SetOriginPatterns([]string{"*"})
+	s.SetPingInterval(0)
+	s.SetReadLimit(1024)
+	got := make(chan string, 1)
+	s.Of("/").On("msg", func(_ *ConnContext, data any) { got <- data.(string) })
+	return s, got
+}
+
+// assertReadLimit checks a message within the limit is handled and a larger one closes with 1009
+func assertReadLimit(t *testing.T, url string, got chan string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	small := dialWS(t, url)
+	if err := wsjson.Write(ctx, small, Message{Event: "msg", Data: "hi"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case v := <-got:
+		if v != "hi" {
+			t.Errorf("got %q, want hi", v)
+		}
+	case <-ctx.Done():
+		t.Fatal("message within limit was not processed")
+	}
+
+	big := dialWS(t, url)
+	if err := wsjson.Write(ctx, big, Message{Event: "msg", Data: strings.Repeat("x", 2048)}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, _, err := big.Read(ctx)
+	if code := websocket.CloseStatus(err); code != websocket.StatusMessageTooBig {
+		t.Errorf("close status = %v (err %v), want 1009", code, err)
+	}
+	select {
+	case <-got:
+		t.Error("message over limit must not be processed")
+	default:
+	}
+}
+
+func TestServerReadLimit(t *testing.T) {
+	s, got := newLimitServer()
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	assertReadLimit(t, "ws"+strings.TrimPrefix(srv.URL, "http")+DefaultWSPath, got)
+}
+
+// newCloseServer returns a server whose connections are closed with 4401 right after connecting
+func newCloseServer() *Server {
+	s := newTestServer()
+	s.SetOriginPatterns([]string{"*"})
+	s.SetPingInterval(0)
+	s.Of("/").OnConnect(func(ctx *ConnContext) error {
+		go ctx.CloseWith(4401, "unauthorized")
+		return nil
+	})
+	return s
+}
+
+// assertCloseFrame checks the client receives close code 4401 with its reason
+func assertCloseFrame(t *testing.T, url string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := dialWS(t, url).Read(ctx)
+	var ce websocket.CloseError
+	if !errors.As(err, &ce) || ce.Code != 4401 || ce.Reason != "unauthorized" {
+		t.Errorf("close = %v, want 4401 unauthorized", err)
+	}
+}
+
+func TestServerCloseWithCode(t *testing.T) {
+	srv := httptest.NewServer(newCloseServer().Handler())
+	defer srv.Close()
+	assertCloseFrame(t, "ws"+strings.TrimPrefix(srv.URL, "http")+DefaultWSPath)
+}
+
 // Mock adapter for testing
 type mockAdapter struct {
 	loggerSet bool
 	closed    bool
+
+	mu         sync.Mutex
+	handler    func(data BroadcastData)
+	broadcasts []BroadcastData
 }
 
-func (m *mockAdapter) Broadcast(namespace string, data BroadcastData) {}
+func (m *mockAdapter) Broadcast(namespace string, data BroadcastData) {
+	m.mu.Lock()
+	m.broadcasts = append(m.broadcasts, data)
+	m.mu.Unlock()
+}
 
-func (m *mockAdapter) Subscribe(namespace string, handler func(data BroadcastData)) {}
+func (m *mockAdapter) Subscribe(namespace string, handler func(data BroadcastData)) {
+	m.mu.Lock()
+	m.handler = handler
+	m.mu.Unlock()
+}
 
 func (m *mockAdapter) Unsubscribe(namespace string) {}
 
@@ -371,6 +473,20 @@ func (m *mockAdapter) SetLogger(logger Logger) {
 
 func (m *mockAdapter) Close() {
 	m.closed = true
+}
+
+// deliver simulates a payload arriving from another node
+func (m *mockAdapter) deliver(data BroadcastData) {
+	m.mu.Lock()
+	h := m.handler
+	m.mu.Unlock()
+	h(data)
+}
+
+func (m *mockAdapter) sent() []BroadcastData {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]BroadcastData(nil), m.broadcasts...)
 }
 
 func BenchmarkServerOf(b *testing.B) {

@@ -16,7 +16,7 @@ type ErrorCallback func(err error)
 
 // Adapter implements multi-node broadcasting via Redis Pub/Sub
 type Adapter struct {
-	client *redis.Client
+	client redis.UniversalClient
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -54,8 +54,9 @@ type Config struct {
 	ErrorCallback   ErrorCallback // Error callback (optional)
 }
 
-// New creates a new Redis adapter with optional config
-func New(client *redis.Client, cfg ...*Config) (*Adapter, error) {
+// New creates a new Redis adapter with optional config.
+// Accepts any redis.UniversalClient (*redis.Client, cluster, sentinel/failover).
+func New(client redis.UniversalClient, cfg ...*Config) (*Adapter, error) {
 	// Test connection
 	ctx := context.Background()
 	if err := client.Ping(ctx).Err(); err != nil {

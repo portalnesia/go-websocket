@@ -1,9 +1,11 @@
 package websocket
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // Namespace represents a logical boundary for connections and events
@@ -44,12 +46,23 @@ func (n *Namespace) On(event string, handler EventHandler) {
 
 // OnConnect sets the connection handler
 func (n *Namespace) OnConnect(handler ConnectHandler) {
+	n.handlersMu.Lock()
+	defer n.handlersMu.Unlock()
 	n.onConnect = handler
 }
 
 // OnDisconnect sets the disconnect handler
 func (n *Namespace) OnDisconnect(handler DisconnectHandler) {
+	n.handlersMu.Lock()
+	defer n.handlersMu.Unlock()
 	n.onDisconnect = handler
+}
+
+// lifecycleHandlers returns the current OnConnect/OnDisconnect handlers
+func (n *Namespace) lifecycleHandlers() (ConnectHandler, DisconnectHandler) {
+	n.handlersMu.RLock()
+	defer n.handlersMu.RUnlock()
+	return n.onConnect, n.onDisconnect
 }
 
 // init initializes the namespace
@@ -57,27 +70,43 @@ func (n *Namespace) init() {
 	// Subscribe to namespace broadcasts
 	if n.server.adapter != nil {
 		n.server.GetLogger().Debug("Subscribing to adapter", "namespace", n.name)
-		n.server.adapter.Subscribe(n.name, func(data BroadcastData) {
-			if data.FromServerID == n.server.id {
-				// Ignore messages from self
-				return
-			}
+		n.server.adapter.Subscribe(n.name, n.handleAdapter)
+	}
+}
 
-			if data.Room != "" {
-				n.broadcastToRoomLocal(data.Room, data.Message)
-			} else if data.Key != "" && data.Value != nil {
-				// Find local connections with matching key-value and emit
-				connections := n.FilterConnections(func(ctx *ConnContext) bool {
-					return ctx.Local(data.Key) == data.Value
-				})
-				for _, conn := range connections {
-					_ = conn.Emit(data.Message.Message.Event, data.Message.Message.Data)
-				}
-			} else {
-				// Broadcast to local connections
-				n.broadcastLocal(data.Message)
-			}
+// handleAdapter applies a payload received from another node to local connections
+func (n *Namespace) handleAdapter(data BroadcastData) {
+	defer func() {
+		if r := recover(); r != nil {
+			n.server.GetLogger().Error("Panic in adapter handler", "namespace", n.name, "panic", r)
+		}
+	}()
+
+	if data.FromServerID == n.server.id {
+		// Ignore messages from self
+		return
+	}
+
+	if data.Action != "" {
+		// Unknown actions are ignored so a newer node cannot trigger a broadcast here
+		if data.Action == BroadcastActionClose && len(data.Rooms) > 0 {
+			n.closeRoomsLocal(data.Rooms, n.closeCode(data.Code), data.Reason)
+		}
+	} else if len(data.Rooms) > 0 {
+		n.broadcastToRoomsLocal(data.Rooms, data.Message)
+	} else if data.Room != "" {
+		n.broadcastToRoomLocal(data.Room, data.Message)
+	} else if data.Key != "" && data.Value != nil {
+		// Find local connections with matching key-value and emit
+		connections := n.FilterConnections(func(ctx *ConnContext) bool {
+			return ctx.Local(data.Key) == data.Value
 		})
+		for _, conn := range connections {
+			_ = conn.Emit(data.Message.Message.Event, data.Message.Message.Data)
+		}
+	} else {
+		// Broadcast to local connections
+		n.broadcastLocal(data.Message)
 	}
 }
 
@@ -148,8 +177,8 @@ func (n *Namespace) addConn(connID string, ws WSConn, r *http.Request) *ConnCont
 	}
 
 	// Call onConnect handler
-	if n.onConnect != nil {
-		if err := n.onConnect(ctx); err != nil {
+	if onConnect, _ := n.lifecycleHandlers(); onConnect != nil {
+		if err := onConnect(ctx); err != nil {
 			// Reject connection
 			_ = ws.Close(1008, "connection rejected")
 			n.server.GetLogger().Debug("Connection rejected", "namespace", n.name, "connID", connID, "error", err.Error())
@@ -163,6 +192,8 @@ func (n *Namespace) addConn(connID string, ws WSConn, r *http.Request) *ConnCont
 		ctx:  ctx, // Store context in wrapper
 	}
 
+	ws.SetReadLimit(n.server.readLimit)
+
 	n.mu.Lock()
 	if n.conns == nil {
 		n.conns = make(map[string]*connWrapper)
@@ -174,6 +205,9 @@ func (n *Namespace) addConn(connID string, ws WSConn, r *http.Request) *ConnCont
 
 	go n.startWriteLoop(cw)
 	go n.startReadLoop(ctx, cw)
+	if interval := n.server.pingInterval; interval > 0 {
+		go n.startHeartbeat(cw, interval, n.server.pongTimeout)
+	}
 
 	return ctx
 }
@@ -182,6 +216,30 @@ func (n *Namespace) startWriteLoop(cw *connWrapper) {
 	for msg := range cw.send {
 		if err := cw.ws.WriteJSON(msg); err != nil {
 			n.server.GetLogger().Error("Write error", "namespace", n.name, "connID", cw.ctx.id, "error", err.Error())
+			n.closeConn(cw.ctx, 1000, "connection closed")
+			return
+		}
+	}
+}
+
+// startHeartbeat pings every interval and closes the connection when a pong does not arrive within timeout
+func (n *Namespace) startHeartbeat(cw *connWrapper, interval, timeout time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-cw.ctx.done:
+			return
+		case <-ticker.C:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := cw.ws.Ping(ctx)
+		cancel()
+		if err != nil {
+			n.server.GetLogger().Debug("Ping failed", "namespace", n.name, "connID", cw.ctx.id, "error", err.Error())
+			n.closeConn(cw.ctx, 1000, "ping timeout")
 			return
 		}
 	}
@@ -190,7 +248,7 @@ func (n *Namespace) startWriteLoop(cw *connWrapper) {
 func (n *Namespace) startReadLoop(ctx *ConnContext, cw *connWrapper) {
 	defer func() {
 		n.server.GetLogger().Debug("Client disconnected", "namespace", n.name, "connID", ctx.id)
-		n.closeConn(ctx)
+		n.closeConn(ctx, 1000, "connection closed")
 	}()
 
 	for {
@@ -217,9 +275,10 @@ func (n *Namespace) startReadLoop(ctx *ConnContext, cw *connWrapper) {
 }
 
 func (n *Namespace) emitToConn(connID string, msg Message) error {
+	// Hold the read lock while sending: closeConn closes cw.send only after removing it under n.mu.Lock
 	n.mu.RLock()
+	defer n.mu.RUnlock()
 	cw, ok := n.conns[connID]
-	n.mu.RUnlock()
 
 	if !ok {
 		n.server.GetLogger().Debug("Connection not found", "namespace", n.name, "connID", connID)
@@ -322,30 +381,62 @@ func (n *Namespace) EmitToRoom(roomName string, message Message) {
 	n.broadcastToRoomLocal(roomName, nodeMsg)
 }
 
+// EmitToRooms broadcasts to all connections in any of the rooms; a connection in several rooms receives it once
+func (n *Namespace) EmitToRooms(rooms []string, message Message) {
+	if len(rooms) == 0 {
+		return
+	}
+	nodeMsg := MessageMultiNodes{Message: message}
+
+	if n.server.adapter != nil {
+		n.server.adapter.Broadcast(n.name, BroadcastData{
+			FromServerID: n.server.id,
+			Rooms:        rooms,
+			Key:          legacyGuardKey,
+			Value:        true,
+			Message:      nodeMsg,
+		})
+	}
+
+	n.broadcastToRoomsLocal(rooms, nodeMsg)
+}
+
 // broadcastToRoomLocal broadcasts to local room connections only
-// Runs in goroutine to avoid blocking caller
 func (n *Namespace) broadcastToRoomLocal(roomName string, msg MessageMultiNodes) {
+	n.broadcastToRoomsLocal([]string{roomName}, msg)
+}
+
+// roomConnIDs returns the deduplicated IDs of local connections in any of the rooms
+func (n *Namespace) roomConnIDs(roomNames []string) map[string]struct{} {
+	ids := make(map[string]struct{})
+	n.roomsMu.RLock()
+	defer n.roomsMu.RUnlock()
+	for _, name := range roomNames {
+		if room, ok := n.rooms[name]; ok {
+			for _, id := range room.getConnIDs() {
+				ids[id] = struct{}{}
+			}
+		}
+	}
+	return ids
+}
+
+// broadcastToRoomsLocal broadcasts to local connections in any of the rooms, once per connection
+// Runs in goroutine to avoid blocking caller
+func (n *Namespace) broadcastToRoomsLocal(roomNames []string, msg MessageMultiNodes) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				n.server.GetLogger().Error("Panic in broadcastToRoomLocal", "namespace", n.name, "room", roomName, "panic", r)
+				n.server.GetLogger().Error("Panic in broadcastToRoomsLocal", "namespace", n.name, "panic", r)
 			}
 		}()
 
-		n.roomsMu.RLock()
-		room, ok := n.rooms[roomName]
-		n.roomsMu.RUnlock()
-
-		if !ok {
-			return
-		}
-
-		connIDs := room.getConnIDs()
+		connIDs := n.roomConnIDs(roomNames)
 
 		n.mu.RLock()
 		defer n.mu.RUnlock()
 
-		for _, connID := range connIDs {
+		for connID := range connIDs {
 			// Skip if in except list
 			if filterExceptConnIDs(connID, msg.ExceptConnID) {
 				continue
@@ -446,7 +537,22 @@ func (n *Namespace) RoomSize(roomName string) int {
 	return room.size()
 }
 
-func (n *Namespace) closeConn(ctx *ConnContext) {
+// closeConn closes the connection and waits for the close frame; internal goroutines and shutdown use it
+func (n *Namespace) closeConn(ctx *ConnContext, code int, reason string) {
+	if cw := n.detachConn(ctx); cw != nil {
+		n.finishConn(cw, code, reason)
+	}
+}
+
+// closeConnAsync detaches the connection now and sends the close frame in background
+func (n *Namespace) closeConnAsync(ctx *ConnContext, code int, reason string) {
+	if cw := n.detachConn(ctx); cw != nil {
+		go n.finishConn(cw, code, reason)
+	}
+}
+
+// detachConn removes the connection from the namespace and its rooms; nil if already removed
+func (n *Namespace) detachConn(ctx *ConnContext) *connWrapper {
 	// Get wrapper which contains context first (before removing from rooms)
 	n.mu.Lock()
 	cw, ok := n.conns[ctx.id]
@@ -460,7 +566,7 @@ func (n *Namespace) closeConn(ctx *ConnContext) {
 	n.mu.Unlock()
 
 	if !ok {
-		return
+		return nil
 	}
 
 	// Remove from all rooms after releasing conns lock
@@ -482,15 +588,67 @@ func (n *Namespace) closeConn(ctx *ConnContext) {
 	}
 	n.roomsMu.Unlock()
 
-	// Close connection and cleanup
+	return cw
+}
+
+// finishConn sends the close frame, releases the connection goroutines and calls OnDisconnect.
+// Called once per connection: only the caller that detached it gets cw.
+func (n *Namespace) finishConn(cw *connWrapper, code int, reason string) {
+	ctx := cw.ctx
 	cw.once.Do(func() {
 		close(cw.send)
-		_ = cw.ws.Close(1000, "connection closed")
+		_ = cw.ws.Close(code, reason)
 		close(ctx.done)
 	})
 
-	if n.onDisconnect != nil {
-		n.onDisconnect(ctx)
+	defer func() {
+		if r := recover(); r != nil {
+			n.server.GetLogger().Error("Panic in disconnect handler", "namespace", n.name, "connID", ctx.id, "panic", r)
+		}
+	}()
+	if _, onDisconnect := n.lifecycleHandlers(); onDisconnect != nil {
+		onDisconnect(ctx)
+	}
+}
+
+// closeCode returns code when the application may send it (1000 or 3000-4999), otherwise 1000
+func (n *Namespace) closeCode(code int) int {
+	if code == 1000 || (code >= 3000 && code <= 4999) {
+		return code
+	}
+	n.server.GetLogger().Warn("Invalid close code, using 1000", "namespace", n.name, "code", code)
+	return 1000
+}
+
+// CloseRooms closes every connection in any of the rooms, on all nodes, with code and reason.
+// Valid codes are 1000 and 3000-4999; others are replaced by 1000.
+func (n *Namespace) CloseRooms(rooms []string, code int, reason string) {
+	if len(rooms) == 0 {
+		return
+	}
+	code = n.closeCode(code)
+
+	if n.server.adapter != nil {
+		n.server.adapter.Broadcast(n.name, BroadcastData{
+			FromServerID: n.server.id,
+			Action:       BroadcastActionClose,
+			Rooms:        rooms,
+			Code:         code,
+			Reason:       reason,
+			Key:          legacyGuardKey,
+			Value:        true,
+		})
+	}
+
+	n.closeRoomsLocal(rooms, code, reason)
+}
+
+// closeRoomsLocal closes local connections in any of the rooms
+func (n *Namespace) closeRoomsLocal(rooms []string, code int, reason string) {
+	for connID := range n.roomConnIDs(rooms) {
+		if ctx := n.GetConnection(connID); ctx != nil {
+			n.closeConnAsync(ctx, code, reason)
+		}
 	}
 }
 
@@ -522,13 +680,13 @@ func (n *Namespace) GetConnection(connID string) *ConnContext {
 // FilterConnections filters connections based on a predicate function in this nodes
 func (n *Namespace) FilterConnections(predicate func(*ConnContext) bool) []*ConnContext {
 	n.mu.RLock()
+	defer n.mu.RUnlock() // predicate may panic
 	filtered := make([]*ConnContext, 0)
 	for _, cw := range n.conns {
 		if cw.ctx != nil && predicate(cw.ctx) {
 			filtered = append(filtered, cw.ctx)
 		}
 	}
-	n.mu.RUnlock()
 
 	return filtered
 }
@@ -536,6 +694,7 @@ func (n *Namespace) FilterConnections(predicate func(*ConnContext) bool) []*Conn
 // FindConnection finds the first connection matching the predicate in this nodes
 func (n *Namespace) FindConnection(predicate func(*ConnContext) bool) *ConnContext {
 	n.mu.RLock()
+	defer n.mu.RUnlock() // predicate may panic
 	var found *ConnContext
 	for _, cw := range n.conns {
 		if cw.ctx != nil && predicate(cw.ctx) {
@@ -543,7 +702,6 @@ func (n *Namespace) FindConnection(predicate func(*ConnContext) bool) *ConnConte
 			break
 		}
 	}
-	n.mu.RUnlock()
 
 	return found
 }
@@ -589,7 +747,7 @@ func (n *Namespace) close() {
 
 	// Close all connections
 	for _, ctx := range connCtx {
-		n.closeConn(ctx)
+		n.closeConn(ctx, 1000, "connection closed")
 	}
 
 	// Unsubscribe from adapter

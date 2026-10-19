@@ -177,6 +177,41 @@ func main() {
 		log.Printf("[%s] [Room %s] %v: %v", nodeID, roomName, username, message)
 	})
 
+	// Event: rooms:message - one message to several rooms on ALL nodes.
+	// A user in more than one of the rooms receives it once.
+	// Payload: {"rooms": ["a", "b"], "message": "..."}
+	ns.On("rooms:message", func(ctx *ws.ConnContext, data any) {
+		dataMap, ok := data.(map[string]any)
+		if !ok {
+			return
+		}
+		rooms := stringSlice(dataMap["rooms"])
+		if len(rooms) == 0 {
+			return
+		}
+
+		ns.EmitToRooms(rooms, ws.Message{
+			Event: "rooms:message", Data: map[string]any{
+				"username":  ctx.Local("username"),
+				"rooms":     rooms,
+				"message":   dataMap["message"],
+				"from_node": ctx.Local("nodeID"),
+			},
+		})
+	})
+
+	// Event: rooms:close - disconnect everyone in the rooms on ALL nodes.
+	// Clients receive close code 4000 (application codes are 3000-4999).
+	// Payload: ["a", "b"]
+	ns.On("rooms:close", func(ctx *ws.ConnContext, data any) {
+		rooms := stringSlice(data)
+		if len(rooms) == 0 {
+			return
+		}
+		log.Printf("[%s] %v closing rooms: %v", nodeID, ctx.Local("username"), rooms)
+		ns.CloseRooms(rooms, 4000, "room closed")
+	})
+
 	// Event: node:info (get info about this node)
 	ns.On("node:info", func(ctx *ws.ConnContext, data any) {
 		ctx.Emit("node:info", map[string]any{
@@ -218,4 +253,16 @@ func main() {
 	if err := server.Listen(":" + port); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// stringSlice converts a decoded JSON array into []string, skipping non-string items
+func stringSlice(v any) []string {
+	items, _ := v.([]any)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }

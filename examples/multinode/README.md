@@ -122,6 +122,29 @@ ws://localhost:8082/pn-socket?token=valid-token&username=Charlie
 
 **Result:** All clients in "general" room receive the message across all nodes!
 
+**Send one message to several rooms (`EmitToRooms`):**
+```json
+{
+  "event": "rooms:message",
+  "data": {
+    "rooms": ["general", "random"],
+    "message": "Hello both rooms!"
+  }
+}
+```
+
+A client in both rooms receives it once.
+
+**Close every connection in rooms (`CloseRooms`):**
+```json
+{
+  "event": "rooms:close",
+  "data": ["general"]
+}
+```
+
+Clients in "general" on every node are disconnected with close code `4000` and reason `room closed`.
+
 ## Configuration
 
 ### Environment Variables:

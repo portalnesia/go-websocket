@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -12,6 +13,15 @@ import (
 const (
 	// DefaultWSPath is the default WebSocket endpoint path
 	DefaultWSPath = "/pn-socket"
+
+	// DefaultPingInterval is the default interval between heartbeat pings
+	DefaultPingInterval = 25 * time.Second
+	// DefaultPongTimeout is the default time to wait for a pong before closing the connection
+	DefaultPongTimeout = 10 * time.Second
+	// DefaultWriteTimeout is the default timeout for writing one message
+	DefaultWriteTimeout = 10 * time.Second
+	// DefaultReadLimit is the default max size in bytes of an incoming message
+	DefaultReadLimit = 64 << 10
 )
 
 type Server struct {
@@ -28,6 +38,11 @@ type Server struct {
 
 	// Logger for logging (default: NewDefaultLogger())
 	logger Logger
+
+	pingInterval time.Duration
+	pongTimeout  time.Duration
+	writeTimeout time.Duration
+	readLimit    int64
 }
 
 func NewServer() *Server {
@@ -38,7 +53,42 @@ func NewServer() *Server {
 		originPatterns:  []string{},
 		allowAllOrigins: false,
 		logger:          NewDefaultLogger(),
+		pingInterval:    DefaultPingInterval,
+		pongTimeout:     DefaultPongTimeout,
+		writeTimeout:    DefaultWriteTimeout,
+		readLimit:       DefaultReadLimit,
 	}
+}
+
+// SetPingInterval sets the heartbeat ping interval (0 = heartbeat disabled).
+// Call before serving connections.
+func (s *Server) SetPingInterval(d time.Duration) {
+	s.pingInterval = d
+}
+
+// SetPongTimeout sets how long to wait for a pong before closing the connection
+func (s *Server) SetPongTimeout(d time.Duration) {
+	s.pongTimeout = d
+}
+
+// SetWriteTimeout sets the timeout for writing one message (0 = no timeout).
+// A write exceeding it closes the connection.
+func (s *Server) SetWriteTimeout(d time.Duration) {
+	s.writeTimeout = d
+}
+
+// SetReadLimit sets the max size in bytes of an incoming message (<= 0 = unlimited).
+// A larger message closes the connection with status 1009.
+func (s *Server) SetReadLimit(n int64) {
+	s.readLimit = n
+}
+
+// readWindow is how long a connection may stay silent (no pong) before reads time out
+func (s *Server) readWindow() time.Duration {
+	if s.pingInterval <= 0 {
+		return 0
+	}
+	return s.pingInterval + s.pongTimeout
 }
 
 // SetAdapter sets the adapter for multi-node support
@@ -273,7 +323,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	connID := generateId()
-	ns.addConn(connID, newCoderWSConn(ws), r)
+	ns.addConn(connID, newCoderWSConn(ws, s.writeTimeout), r)
 }
 
 // Listen starts the WebSocket server on the specified address

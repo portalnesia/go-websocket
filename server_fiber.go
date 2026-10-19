@@ -10,15 +10,7 @@ import (
 
 // NewFiberServer creates a new WebSocket server for Fiber framework
 func NewFiberServer() *Server {
-	server := &Server{
-		id:              generateId(),
-		namespaces:      make(map[string]*Namespace),
-		wsPath:          DefaultWSPath,
-		originPatterns:  []string{},
-		allowAllOrigins: false,
-		logger:          NewDefaultLogger(),
-	}
-	return server
+	return NewServer()
 }
 
 // FiberHandler integrates the WebSocket server with Fiber router
@@ -92,7 +84,7 @@ func (s *Server) FiberHandler(router fiber.Router) {
 
 		// Generate connection ID and add to namespace
 		connID := generateId()
-		ctx := ns.addConn(connID, newFiberWSConn(c), req)
+		ctx := ns.addConn(connID, newFiberWSConn(c, s.writeTimeout, s.readWindow()), req)
 
 		// Block until connection is closed
 		// This prevents the handler from returning and closing the connection prematurely

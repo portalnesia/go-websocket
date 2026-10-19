@@ -33,3 +33,5 @@ examples/*/main
 examples/*/main.exe
 
 .github/agents/Aditya*
+
+plan/

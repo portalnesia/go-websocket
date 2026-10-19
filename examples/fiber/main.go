@@ -20,9 +20,15 @@ func main() {
 	server := ws.NewFiberServer()
 	server.SetOriginPatterns([]string{"*"}) // Allow all origins for demo
 
-	// Setup Redis adapter
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+	// Connection limits (these are the defaults)
+	server.SetPingInterval(ws.DefaultPingInterval) // 0 disables heartbeat
+	server.SetPongTimeout(ws.DefaultPongTimeout)
+	server.SetWriteTimeout(ws.DefaultWriteTimeout)
+	server.SetReadLimit(ws.DefaultReadLimit) // larger messages close the connection with 1009
+
+	// Setup Redis adapter (any redis.UniversalClient: single node, cluster, sentinel)
+	redisClient := redis.NewUniversalClient(&redis.UniversalOptions{
+		Addrs: []string{"localhost:6379"},
 	})
 
 	adapter, err := wsRedis.New(redisClient, &wsRedis.Config{
