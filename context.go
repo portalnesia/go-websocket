@@ -14,6 +14,19 @@ type ConnContext struct {
 	local     map[string]any
 	localMu   sync.RWMutex
 	done      chan struct{}
+	// stopped closes once every per-connection goroutine (read, write, heartbeat) has
+	// returned; a transport that recycles its connection object waits on it.
+	stopped chan struct{}
+	// registered and pendingClose are guarded by namespace.mu. A close requested before
+	// the connection is registered (e.g. from OnConnect) is kept in pendingClose and run
+	// when addConn registers it.
+	registered   bool
+	pendingClose *closeIntent
+}
+
+type closeIntent struct {
+	code   int
+	reason string
 }
 
 // ID returns the connection ID

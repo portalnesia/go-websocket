@@ -86,10 +86,11 @@ func (s *Server) FiberHandler(router fiber.Router) {
 		connID := generateId()
 		ctx := ns.addConn(connID, newFiberWSConn(c, s.writeTimeout, s.readWindow()), req)
 
-		// Block until connection is closed
-		// This prevents the handler from returning and closing the connection prematurely
+		// Block until the connection is closed and every per-connection goroutine has
+		// returned: gofiber/websocket recycles *Conn as soon as this handler returns, so a
+		// read loop still inside ReadJSON would touch a released connection.
 		if ctx != nil {
-			<-ctx.Done()
+			<-ctx.stopped
 		}
 	}))
 }

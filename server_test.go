@@ -461,6 +461,25 @@ func TestServerCloseWithCode(t *testing.T) {
 	assertCloseFrame(t, "ws"+strings.TrimPrefix(srv.URL, "http")+DefaultWSPath)
 }
 
+// newCloseInOnConnectServer closes from inside OnConnect, before the connection is
+// registered: the close must still reach the client instead of being dropped.
+func newCloseInOnConnectServer() *Server {
+	s := newTestServer()
+	s.SetOriginPatterns([]string{"*"})
+	s.SetPingInterval(0)
+	s.Of("/").OnConnect(func(ctx *ConnContext) error {
+		ctx.CloseWith(4401, "unauthorized")
+		return nil
+	})
+	return s
+}
+
+func TestServerCloseWithInsideOnConnect(t *testing.T) {
+	srv := httptest.NewServer(newCloseInOnConnectServer().Handler())
+	defer srv.Close()
+	assertCloseFrame(t, "ws"+strings.TrimPrefix(srv.URL, "http")+DefaultWSPath)
+}
+
 // Mock adapter for testing
 type mockAdapter struct {
 	loggerSet bool

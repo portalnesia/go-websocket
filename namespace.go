@@ -14,6 +14,8 @@ type connWrapper struct {
 	send chan Message
 	ctx  *ConnContext
 	once sync.Once
+	// loops counts the per-connection goroutines still using ws
+	loops sync.WaitGroup
 }
 
 type Namespace struct {
@@ -174,6 +176,7 @@ func (n *Namespace) addConn(connID string, ws WSConn, r *http.Request) *ConnCont
 		namespace: n,
 		request:   r,
 		done:      make(chan struct{}),
+		stopped:   make(chan struct{}),
 	}
 
 	// Call onConnect handler
@@ -194,19 +197,48 @@ func (n *Namespace) addConn(connID string, ws WSConn, r *http.Request) *ConnCont
 
 	ws.SetReadLimit(n.server.readLimit)
 
+	// Counted before the connection becomes reachable: once it is in n.conns another
+	// goroutine may close it, and that close is counted against a non-zero counter.
+	interval := n.server.pingInterval
+	if interval > 0 {
+		cw.loops.Add(3)
+	} else {
+		cw.loops.Add(2)
+	}
+
 	n.mu.Lock()
 	if n.conns == nil {
 		n.conns = make(map[string]*connWrapper)
 	}
 	n.conns[connID] = cw
+	ctx.registered = true
+	pending := ctx.pendingClose
+	ctx.pendingClose = nil
 	n.mu.Unlock()
 
 	n.server.GetLogger().Debug("Client connected", "namespace", n.name, "connID", connID)
 
-	go n.startWriteLoop(cw)
-	go n.startReadLoop(ctx, cw)
-	if interval := n.server.pingInterval; interval > 0 {
-		go n.startHeartbeat(cw, interval, n.server.pongTimeout)
+	go func() {
+		defer cw.loops.Done()
+		n.startWriteLoop(cw)
+	}()
+	go func() {
+		defer cw.loops.Done()
+		n.startReadLoop(ctx, cw)
+	}()
+	if interval > 0 {
+		go func() {
+			defer cw.loops.Done()
+			n.startHeartbeat(cw, interval, n.server.pongTimeout)
+		}()
+	}
+	go func() {
+		cw.loops.Wait()
+		close(ctx.stopped)
+	}()
+
+	if pending != nil {
+		n.closeConnAsync(ctx, pending.code, pending.reason)
 	}
 
 	return ctx
@@ -546,8 +578,24 @@ func (n *Namespace) closeConn(ctx *ConnContext, code int, reason string) {
 
 // closeConnAsync detaches the connection now and sends the close frame in background
 func (n *Namespace) closeConnAsync(ctx *ConnContext, code int, reason string) {
+	// Not registered yet: addConn runs this close once it registers the connection.
+	n.mu.Lock()
+	if !ctx.registered {
+		ctx.pendingClose = &closeIntent{code: code, reason: reason}
+		n.mu.Unlock()
+		return
+	}
+	n.mu.Unlock()
+
 	if cw := n.detachConn(ctx); cw != nil {
-		go n.finishConn(cw, code, reason)
+		// Counted like the other per-connection goroutines: it still uses ws. The write
+		// loop keeps the counter above zero here, since it only ends once finishConn
+		// closes cw.send.
+		cw.loops.Add(1)
+		go func() {
+			defer cw.loops.Done()
+			n.finishConn(cw, code, reason)
+		}()
 	}
 }
 

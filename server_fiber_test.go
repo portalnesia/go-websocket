@@ -18,3 +18,9 @@ func TestFiberCloseWithCode(t *testing.T) {
 	newCloseServer().FiberHandler(app)
 	assertCloseFrame(t, startFiber(t, app)+DefaultWSPath)
 }
+
+func TestFiberCloseWithInsideOnConnect(t *testing.T) {
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	newCloseInOnConnectServer().FiberHandler(app)
+	assertCloseFrame(t, startFiber(t, app)+DefaultWSPath)
+}
