@@ -250,6 +250,24 @@ func TestServerCheckOrigin(t *testing.T) {
 		}
 	})
 
+	t.Run("Patterns configured - request host is still allowed", func(t *testing.T) {
+		// A page and its socket share an origin; extra patterns widen the allow-list for
+		// cross-origin callers and must not take same-origin connections away.
+		server.SetOriginPatterns([]string{"admin.example.com"})
+
+		if !server.checkOrigin("https://erp.client.com", "erp.client.com") {
+			t.Error("Should allow origin matching request host even with patterns set")
+		}
+
+		if !server.checkOrigin("https://admin.example.com", "erp.client.com") {
+			t.Error("Should still allow configured pattern")
+		}
+
+		if server.checkOrigin("https://evil.com", "erp.client.com") {
+			t.Error("Should not allow origin that matches neither host nor patterns")
+		}
+	})
+
 	t.Run("Trailing slash handling", func(t *testing.T) {
 		server.SetOriginPatterns([]string{"example.com"})
 

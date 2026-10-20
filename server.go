@@ -185,9 +185,9 @@ func (s *Server) SetWSPath(path string) {
 
 // SetOriginPatterns sets allowed origin patterns
 // Origin validation behavior:
-//   - Default: Only allows origin matching the request host
-//     (e.g., if running on https://domain.com, only https://domain.com is allowed)
-//   - To allow specific origins:
+//   - Always: allows origin matching the request host
+//     (e.g., if running on https://domain.com, https://domain.com is allowed)
+//   - To allow additional origins:
 //     server.SetOriginPatterns([]string{"example.com", "localhost:3000"})
 //   - To allow all origins (NOT recommended for production):
 //     server.SetOriginPatterns([]string{"*"})
@@ -227,13 +227,13 @@ func (s *Server) checkOrigin(origin string, host string) bool {
 	// Normalize once
 	normalizedOrigin := strings.TrimSuffix(origin, "/")
 
-	// If no patterns configured, use request host as allowed origin
+	// The request host is always an allowed origin: a page and its socket share an origin,
+	// and configured patterns only add cross-origin callers on top of it.
+	if normalizedOrigin == "https://"+host || normalizedOrigin == "http://"+host {
+		return true
+	}
 	if len(s.originPatterns) == 0 && len(s.originRegexps) == 0 {
-		// Build expected origins from host
-		expectedHTTPS := "https://" + host
-		expectedHTTP := "http://" + host
-
-		return normalizedOrigin == expectedHTTPS || normalizedOrigin == expectedHTTP
+		return false
 	}
 
 	// Check regex patterns first (usually more specific)

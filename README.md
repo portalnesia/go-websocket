@@ -115,7 +115,8 @@ server := websocket.NewServer()
 // Custom WebSocket path (default: /pn-socket)
 server.SetWSPath("/custom-path")
 
-// Configure allowed origins
+// The request host is always an allowed origin (same-origin pages, custom domains).
+// Patterns add cross-origin callers on top of it.
 server.SetOriginPatterns([]string{"example.com", "localhost:3000"})
 // Or allow all origins (not recommended for production)
 server.SetOriginPatterns([]string{"*"})
